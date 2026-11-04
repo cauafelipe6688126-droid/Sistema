@@ -50,13 +50,14 @@ const $=s=>document.querySelector(s),route=()=>(location.hash||'#').slice(1);
 const stLabel=s=>({novo:'🆕 Recebido',preparo:'🔥 Em preparo',pronto:'✅ Pronto',entregue:'Entregue'}[s]);
 const SEED=[["Pratos","Filé à parmegiana","Arroz, fritas e salada",42],["Pratos","Feijoada completa","Serve 1 pessoa",38],["Bebidas","Coca-Cola lata","350 ml",7],["Bebidas","Suco de laranja","Natural 400 ml",10],["Sobremesas","Pudim","Fatia",12]];
 let cart={};
+let autoPrint=localStorage.getItem('auto')==='1',printed=new Set(JSON.parse(localStorage.getItem('printed')||'[]')),queue=[],printing=false,btDev=null,btChar=null,btWNR=false;
 
 /* ---- dados ---- */
 onSnapshot(collection(db,"menu"),s=>{menu=s.docs.map(d=>({id:d.id,...d.data()}));render()},e=>console.error(e));
 onAuthStateChanged(auth,u=>{
   user=u;if(unsubOrders){unsubOrders();unsubOrders=null}
   if(u){const q=query(collection(db,"orders"),where("t",">=",Date.now()-3*864e5),orderBy("t"));
-    unsubOrders=onSnapshot(q,s=>{orders=s.docs.map(d=>({id:d.id,...d.data()}));render()},e=>console.error(e))}
+    unsubOrders=onSnapshot(q,s=>{orders=s.docs.map(d=>({id:d.id,...d.data()}));checkPrint();render()},e=>console.error(e))}
   else orders=[];
   render();
 });
@@ -114,15 +115,75 @@ async function send(n){
 /* ---- cozinha ---- */
 function kitchen(){
   const at=orders.filter(o=>o.status!=='entregue');
-  return `<h1>👨‍🍳 Cozinha <span class="tag">${at.length}</span></h1>`+(at.length?'':'<p class="mu">Nenhum pedido no momento.</p>')+
+  return `<h1>👨‍🍳 Cozinha <span class="tag">${at.length}</span></h1>`+`<label class="card row noprint"><span>🖨️ Imprimir pedidos automaticamente neste aparelho</span><input type="checkbox" ${autoPrint?'checked':''} onchange="setAuto(this.checked)"></label>`+`<div class="card row noprint"><span>📶 Bluetooth: ${btDev?'conectada ('+esc(btDev.name||'impressora')+')':'não conectada'}</span><span><select onchange="setCols(this.value)"><option value="32" ${(localStorage.getItem('cols')||'32')==='32'?'selected':''}>58 mm</option><option value="48" ${localStorage.getItem('cols')==='48'?'selected':''}>80 mm</option></select> <button onclick="connectBT()">Conectar</button></span></div>`+(at.length?'':'<p class="mu">Nenhum pedido no momento.</p>')+
   at.map(o=>`<div class="card"><div class="row"><b>Pedido #${o.num} · Mesa ${esc(o.mesa)}</b><span class="tag">${stLabel(o.status)} · ${new Date(o.t).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}</span></div>
   <ul>${o.items.map(i=>`<li><b>${i.q}×</b> ${esc(i.n)}</li>`).join('')}</ul>${o.obs?`<div class="mu">📝 ${esc(o.obs)}</div>`:''}
-  <div class="row" style="margin-top:8px"><span>${R(o.total)}</span><span>
+  <div class="row" style="margin-top:8px"><span>${R(o.total)} <button class="g noprint" onclick="reprint('${o.id}')">🖨️</button></span><span>
   ${o.status==='novo'?`<button onclick="st('${o.id}','preparo')">Em preparo</button>`:''}
   ${o.status==='preparo'?`<button onclick="st('${o.id}','pronto')">Pronto</button>`:''}
   ${o.status==='pronto'?`<button onclick="st('${o.id}','entregue')">Entregue</button>`:''}</span></div></div>`).join('');
 }
 const st=(id,s)=>updateDoc(doc(db,"orders",id),{status:s}).catch(()=>alert('Sem permissão.'));
+
+/* ---- impressão automática da cozinha ---- */
+const ticket=o=>`<div style="text-align:center;font-size:16px"><b>PEDIDO #${o.num}</b><br><b>MESA ${esc(o.mesa)}</b><br>${new Date(o.t).toLocaleString('pt-BR')}</div><hr>`+o.items.map(i=>`<b>${i.q}x</b> ${esc(i.n)}`).join('<br>')+(o.obs?`<hr>OBS: ${esc(o.obs)}`:'')+'<hr>';
+const savePrinted=()=>localStorage.setItem('printed',JSON.stringify([...printed].slice(-300)));
+function setAuto(v){autoPrint=v;localStorage.setItem('auto',v?'1':'0');if(v){orders.forEach(o=>printed.add(o.id));savePrinted()}render()}
+function checkPrint(){
+  if(!autoPrint)return;
+  orders.filter(o=>!printed.has(o.id)&&o.status==='novo').forEach(o=>{printed.add(o.id);queue.push(o)});
+  savePrinted();runQueue();
+}
+function reprint(id){const o=orders.find(x=>x.id===id);if(o){queue.push(o);runQueue()}}
+function runQueue(){
+  if(printing||!queue.length)return;printing=true;
+  const o=queue.shift();
+  if(btDev){
+    printBT(o).catch(e=>{console.error(e);alert('Falha na impressora Bluetooth. Toque em Conectar para reconectar.');btDev=null;btChar=null;render()}).finally(()=>{printing=false;runQueue()});
+    return;
+  }
+  $('#cupom').innerHTML=ticket(o);document.body.classList.add('pc');
+  setTimeout(()=>{print();document.body.classList.remove('pc');setTimeout(()=>{printing=false;runQueue()},700)},300);
+}
+
+/* ---- Bluetooth (ESC/POS via Web Bluetooth, impressoras BLE) ---- */
+const SERV=[0x18f0,0xff00,0xfff0,0xffe0,0xae30,0xffb0,0xfee7,'49535343-fe7d-4ae5-8fa9-9fafd205e455','e7810a71-73ae-499d-8c15-faa9aef0c3f2'];
+async function findChar(s){
+  for(const sv of await s.getPrimaryServices())for(const c of await sv.getCharacteristics())
+    if(c.properties.write||c.properties.writeWithoutResponse){btWNR=c.properties.writeWithoutResponse;return c}
+  return null;
+}
+async function connectBT(){
+  if(!navigator.bluetooth)return alert('Este navegador não suporta Bluetooth. Use o Chrome (Android ou computador).');
+  try{
+    const d=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:SERV});
+    const c=await findChar(await d.gatt.connect());
+    if(!c)throw new Error('sem característica de escrita');
+    btDev=d;btChar=c;render();
+  }catch(e){console.error(e);if(e.name!=='NotFoundError')alert('Não foi possível conectar. Se a impressora não aparece na lista, ela pode não ser compatível com Bluetooth BLE.')}
+}
+const setCols=v=>{localStorage.setItem('cols',v)};
+const ascii=s=>String(s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^\x20-\x7e]/g,'?');
+function escpos(o){
+  const e=new TextEncoder(),B=[],add=a=>B.push(...a),txt=s=>add(e.encode(ascii(s)+'\n'));
+  const line='-'.repeat(+(localStorage.getItem('cols')||32));
+  add([0x1B,0x40,0x1B,0x61,1,0x1B,0x45,1,0x1D,0x21,0x11]);txt('PEDIDO #'+o.num);txt('MESA '+o.mesa);
+  add([0x1D,0x21,0,0x1B,0x45,0]);txt(new Date(o.t).toLocaleString('pt-BR'));
+  add([0x1B,0x61,0]);txt(line);
+  add([0x1B,0x45,1]);o.items.forEach(i=>txt(i.q+'x '+i.n));add([0x1B,0x45,0]);
+  if(o.obs){txt(line);txt('OBS: '+o.obs)}
+  txt(line);add([0x0A,0x0A,0x0A,0x1D,0x56,0x00]);
+  return new Uint8Array(B);
+}
+async function printBT(o){
+  if(!btDev.gatt.connected)btChar=await findChar(await btDev.gatt.connect());
+  const b=escpos(o);
+  for(let i=0;i<b.length;i+=20){
+    const c=b.slice(i,i+20);
+    if(btWNR)await btChar.writeValueWithoutResponse(c);else await btChar.writeValue(c);
+    await new Promise(r=>setTimeout(r,25));
+  }
+}
 
 /* ---- caixa ---- */
 function caixa(){
@@ -178,5 +239,5 @@ function qrs(){
 }
 const setBase=v=>{base=v;render()};
 
-Object.assign(window,{chg,send,st,pay,cupom,up,del,add,seed,login,logout,setBase});
+Object.assign(window,{chg,send,st,pay,cupom,up,del,add,seed,login,logout,setBase,setAuto,reprint,connectBT,setCols});
 </script></body></html>
